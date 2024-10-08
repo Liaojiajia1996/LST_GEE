@@ -1,0 +1,88 @@
+// 定义研究区域
+var roi = ee.FeatureCollection('projects/charged-chess-405202/assets/Naha_city');
+Map.centerObject(roi);
+
+// 镶嵌同一天的图像
+var mosaicSameDate = function(img_col){
+  // 获取唯一日期
+  var dates = img_col.aggregate_array('system:time_start')
+                     .map(function(date){ return ee.Date(date).format('YYYY-MM-dd'); })
+                     .distinct();
+  var mosaicByDate = function(img_date){
+    var date = ee.Date(img_date);
+    var start_date = date.advance(-1, 'day').format('YYYY-MM-dd');
+    var end_date = date.advance(1, 'day').format('YYYY-MM-dd');
+    var filteredCollection = img_col.filterDate(start_date, end_date);
+    var mosaic = filteredCollection.mosaic();
+    return mosaic.set('system:time_start', date.format('YYYY-MM-dd'));
+  };
+  var img_col_mosaic = dates.map(mosaicByDate);
+  return ee.ImageCollection.fromImages(img_col_mosaic);
+};
+
+// 使用来自 COPERNICUS/S2_CLOUD_PROBABILITY 的概率波段去除云
+var maskClouds = function(img){
+  var clouds = ee.Image(img.get('cloud_mask')).select('probability');
+  var isNotCloud = clouds.lt(44); // 云概率小于44%被认为是无云像素
+  return img.updateMask(isNotCloud);
+};
+
+// 计算每张图像的 NDVI
+var addNDVI = function(image){
+  var ndvi = image.normalizedDifference(['B8', 'B4']).rename('NDVI');
+  return image.addBands(ndvi);
+};
+
+// 获取 NDVI 图像集合
+var getNDVICol = function(start_date, end_date, region){
+  var s2_img_col = ee.ImageCollection("COPERNICUS/S2_SR_HARMONIZED")
+    .filterDate(start_date, end_date)
+    .filterBounds(region)
+    .map(function(image){ return image.clip(region); });
+  
+  var cloud_s2_img_col = ee.ImageCollection("COPERNICUS/S2_CLOUD_PROBABILITY")
+    .filterDate(start_date, end_date)
+    .filterBounds(region)
+    .map(function(image){ return image.clip(region); });
+    
+  // 结合云概率图像集以去除云
+  var s2SrWithCloudMask = ee.Join.saveFirst('cloud_mask').apply({
+    primary: s2_img_col,
+    secondary: cloud_s2_img_col,
+    condition: ee.Filter.equals({leftField: 'system:index', rightField: 'system:index'})
+  });
+  
+  var s2CloudMasked = ee.ImageCollection(s2SrWithCloudMask).map(maskClouds);
+  var mosaic_img_col = mosaicSameDate(s2CloudMasked); // 镶嵌同一天的不同区域图像
+  var s2_ndvi_img_col = mosaic_img_col.map(addNDVI);
+  return s2_ndvi_img_col;
+};
+
+////////////////////////////////////////////////////////////////////////////////////
+// 设置时间范围和区域
+var start_date = '2023-08-01';
+var end_date = '2023-08-31';
+var region = roi;
+
+// 获取 Sentinel-2 NDVI 图像集合
+var s2_ndvi_img_col = getNDVICol(start_date, end_date, region);
+print(s2_ndvi_img_col);
+
+// 计算 NDVI 的最大值
+var max_ndvi = s2_ndvi_img_col.map(function(image){ return image.select('NDVI'); }).max();
+print(max_ndvi);
+
+// 将最大 NDVI 可视化
+Map.addLayer(max_ndvi, {bands: ['NDVI'], min: -1, max: 1}, 'Max NDVI August 2023');
+Map.centerObject(region, 10);
+
+// 导出到 Google Drive
+Export.image.toDrive({
+  image: max_ndvi.select("NDVI"),
+  scale: 10,
+  crs: "EPSG:4326",
+  region: region,
+  maxPixels: 1e13,
+  description: "NDVI_Max_August_2023",
+  folder: 'NDVI_August'
+});
